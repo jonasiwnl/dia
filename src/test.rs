@@ -1,6 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Serialize, Deserialize};
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::{client::{Client, ProcessMessage}, error::DiaError, sequencer::Sequencer};
 
@@ -10,25 +12,18 @@ struct TestMessage {
 }
 
 struct TestMessageProcessor {
-    recv: Mutex<String>,
-}
-
-impl TestMessageProcessor {
-    fn new() -> Self {
-        Self{ recv: Mutex::from(String::from("")) }
-    }
+    tx: UnboundedSender<String>,
 }
 
 impl ProcessMessage for TestMessageProcessor {
     type Message = TestMessage;
 
     fn create_message(&self, data: String) -> Self::Message {
-        TestMessage{msg: data}
+        TestMessage { msg: data }
     }
 
     fn message_handler(&self, message: Self::Message) {
-        let mut guard = self.recv.lock().unwrap();
-        *guard = message.msg;
+        let _ = self.tx.send(message.msg);
     }
 }
 
@@ -39,24 +34,32 @@ async fn test_basic() -> Result<(), DiaError> {
 
     let sequencer = Sequencer::new(propose_addr, consensus_addr);
     tokio::spawn(async move { sequencer.start().await });
-    let client = Arc::new(Client::new(propose_addr, consensus_addr, TestMessageProcessor::new()));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = Arc::new(Client::new(
+        propose_addr,
+        consensus_addr,
+        TestMessageProcessor { tx },
+    ));
     let listener = Arc::clone(&client);
     tokio::spawn(async move { listener.listen().await });
 
-    // TODO: race condition
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
     let msg = String::from("pooper");
-    client.write_message(TestMessage{msg: msg.clone()}).await?;
 
-    // TODO: race condition
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let received = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            client.write_message(TestMessage { msg: msg.clone() }).await?;
+            let _ = rx.recv().await;
+            if let Ok(Some(s)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                return Ok::<String, DiaError>(s);
+            }
+        }
+    })
+    .await
+    .expect("round-trip timed out")?;
 
-    let recv_msg = client.processor.recv.lock().unwrap();
-    assert_eq!(*recv_msg, msg);
-
-    // TODO: race condition
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
+    assert_eq!(received, msg);
     Ok(())
 }
