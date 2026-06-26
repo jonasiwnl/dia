@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::net::UdpSocket;
 
 use crate::{error::DiaError, sequencer::SequencerHeader, util::{open_multicast_reader, open_multicast_writer}};
 
@@ -13,23 +14,27 @@ pub trait ProcessMessage {
 pub struct Client<MessageProcessor> {
     propose_addr: SocketAddr,
     consensus_addr: SocketAddr,
+    reader_socket: UdpSocket,
+    writer_socket: UdpSocket,
     pub processor: MessageProcessor,
 }
 
 impl<MessageProcessor: ProcessMessage> Client<MessageProcessor> {
-    pub fn new(propose_addr: SocketAddr, consensus_addr: SocketAddr, processor: MessageProcessor) -> Self {
-        Self {
+    pub async fn bind(propose_addr: SocketAddr, consensus_addr: SocketAddr, processor: MessageProcessor) -> Result<Self, DiaError> {
+        let reader_socket = open_multicast_reader(consensus_addr)?;
+        let writer_socket = open_multicast_writer(propose_addr).await?;
+        Ok(Self {
             propose_addr,
             consensus_addr,
+            reader_socket,
+            writer_socket,
             processor,
-        }
+        })
     }
 
     // Sends a message to the sequencer, blocks until it receives a response
     pub async fn write_message(&self, message: <MessageProcessor as ProcessMessage>::Message) -> Result<(), DiaError> {
-        let socket = open_multicast_writer(self.propose_addr).await?;
-
-        let bytes_sent = socket.send_to(&bincode::serialize(&message)?, self.propose_addr).await?;
+        let bytes_sent = self.writer_socket.send_to(&bincode::serialize(&message)?, self.propose_addr).await?;
         eprintln!("[client] successfully broadcasted {} bytes to multicast topic {}", bytes_sent, self.propose_addr);
 
         self.processor.message_handler(message);
@@ -38,13 +43,11 @@ impl<MessageProcessor: ProcessMessage> Client<MessageProcessor> {
     }
 
     pub async fn listen(&self) -> Result<(), DiaError> {
-        let socket = open_multicast_reader(self.consensus_addr)?;
-
         eprintln!("[client] listening on: {}", self.consensus_addr);
         let mut buf = [0u8; 1024];
 
         loop {
-            match socket.recv_from(&mut buf).await {
+            match self.reader_socket.recv_from(&mut buf).await {
                 Ok((amt, src)) => {
                     eprintln!("[client] received {} bytes from {}", amt, src);
                     let (header_bytes, payload) = buf[..amt].split_at(std::mem::size_of::<SequencerHeader>());

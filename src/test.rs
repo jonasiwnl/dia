@@ -32,33 +32,24 @@ async fn test_basic() -> Result<(), DiaError> {
     let propose_addr = "239.0.1.1:6000".parse().unwrap();
     let consensus_addr = "239.0.1.2:6000".parse().unwrap();
 
-    let sequencer = Sequencer::new(propose_addr, consensus_addr);
-    tokio::spawn(async move { sequencer.start().await });
+    let sequencer = Sequencer::bind(propose_addr, consensus_addr).await?;
+    tokio::spawn(sequencer.run());
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Arc::new(Client::new(
-        propose_addr,
-        consensus_addr,
-        TestMessageProcessor { tx },
-    ));
+    let client = Arc::new(
+        Client::bind(propose_addr, consensus_addr, TestMessageProcessor { tx }).await?
+    );
     let listener = Arc::clone(&client);
     tokio::spawn(async move { listener.listen().await });
 
     let msg = String::from("pooper");
+    client.write_message(TestMessage { msg: msg.clone() }).await?;
 
-    let received = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            client.write_message(TestMessage { msg: msg.clone() }).await?;
-            let _ = rx.recv().await;
-            if let Ok(Some(s)) =
-                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-            {
-                return Ok::<String, DiaError>(s);
-            }
-        }
-    })
-    .await
-    .expect("round-trip timed out")?;
+    let _ = rx.recv().await;
+    let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("round-trip timed out")
+        .expect("channel closed");
 
     assert_eq!(received, msg);
     Ok(())
