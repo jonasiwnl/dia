@@ -32,13 +32,9 @@ impl<MessageProcessor: ProcessMessage> Client<MessageProcessor> {
         })
     }
 
-    // Sends a message to the sequencer, blocks until it receives a response
     pub async fn write_message(&self, message: <MessageProcessor as ProcessMessage>::Message) -> Result<(), DiaError> {
         let bytes_sent = self.writer_socket.send_to(&bincode::serialize(&message)?, self.propose_addr).await?;
         eprintln!("[client] successfully broadcasted {} bytes to multicast topic {}", bytes_sent, self.propose_addr);
-
-        self.processor.message_handler(message);
-
         Ok(())
     }
 
