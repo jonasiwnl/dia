@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Serialize, Deserialize};
 
@@ -39,15 +39,24 @@ async fn test_basic() -> Result<(), DiaError> {
 
     let sequencer = Sequencer::new(local, events);
     tokio::spawn(async move { sequencer.start().await });
-    let client = Client::new(local, events, TestMessageProcessor::new());
+    let client = Arc::new(Client::new(local, events, TestMessageProcessor::new()));
+    let listener = Arc::clone(&client);
+    tokio::spawn(async move { listener.listen().await });
+
+    // TODO: race condition
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let msg = String::from("pooper");
     client.write_message(TestMessage{msg: msg.clone()}).await?;
+
+    // TODO: race condition
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     let recv_msg = client.processor.recv.lock().unwrap();
     assert_eq!(*recv_msg, msg);
 
-    // TODO: event driven - this schedules sequencer thread
-    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    // TODO: race condition
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     Ok(())
 }

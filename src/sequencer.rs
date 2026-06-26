@@ -1,8 +1,8 @@
 use std::{net::{Ipv4Addr, SocketAddr}, time::{SystemTime, UNIX_EPOCH}};
 
 use serde::{Serialize, Deserialize};
-use tokio::net::UdpSocket;
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::net::UdpSocket;
 
 use crate::error::DiaError;
 
@@ -12,7 +12,7 @@ pub struct Sequencer {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SequencerHeader {
+pub struct SequencerHeader {
     seq_id: u64,
     timestamp_ns: u64,
 }
@@ -30,6 +30,7 @@ impl Sequencer {
         let bind_addr: SocketAddr = format!("0.0.0.0:{}", self.inbound.port()).parse().unwrap();
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
         socket.bind(&bind_addr.into())?;
         socket.join_multicast_v4(&multicast_ip, &Ipv4Addr::UNSPECIFIED)?;
         let socket: std::net::UdpSocket = socket.into();
