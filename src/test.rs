@@ -34,12 +34,12 @@ impl ProcessMessage for TestMessageProcessor {
 
 #[tokio::test]
 async fn test_basic() -> Result<(), DiaError> {
-    let local = "239.0.1.1:6000".parse().unwrap();
-    let events = "239.0.1.2:6000".parse().unwrap();
+    let propose_addr = "239.0.1.1:6000".parse().unwrap();
+    let consensus_addr = "239.0.1.2:6000".parse().unwrap();
 
-    let sequencer = Sequencer::new(local, events);
+    let sequencer = Sequencer::new(propose_addr, consensus_addr);
     tokio::spawn(async move { sequencer.start().await });
-    let client = Arc::new(Client::new(local, events, TestMessageProcessor::new()));
+    let client = Arc::new(Client::new(propose_addr, consensus_addr, TestMessageProcessor::new()));
     let listener = Arc::clone(&client);
     tokio::spawn(async move { listener.listen().await });
 

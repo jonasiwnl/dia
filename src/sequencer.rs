@@ -1,14 +1,12 @@
-use std::{net::{Ipv4Addr, SocketAddr}, time::{SystemTime, UNIX_EPOCH}};
+use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
 
 use serde::{Serialize, Deserialize};
-use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::UdpSocket;
 
-use crate::error::DiaError;
+use crate::{error::DiaError, util::{open_multicast_reader, open_multicast_writer}};
 
 pub struct Sequencer {
-    inbound: SocketAddr,
-    outbound: SocketAddr,
+    propose_addr: SocketAddr,
+    consensus_addr: SocketAddr,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -18,39 +16,20 @@ pub struct SequencerHeader {
 }
 
 impl Sequencer {
-    pub fn new(inbound: SocketAddr, outbound: SocketAddr) -> Self {
-        Self{ inbound, outbound }
+    pub fn new(propose_addr: SocketAddr, consensus_addr: SocketAddr) -> Self {
+        Self{ propose_addr, consensus_addr }
     }
 
     pub async fn start(&self) -> Result<(), DiaError> {
-        let multicast_ip = match self.inbound {
-            SocketAddr::V4(v4) => *v4.ip(),
-            SocketAddr::V6(_) => panic!("IPv6 not supported"),
-        };
-        let bind_addr: SocketAddr = format!("0.0.0.0:{}", self.inbound.port()).parse().unwrap();
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        socket.set_reuse_address(true)?;
-        socket.set_reuse_port(true)?;
-        socket.bind(&bind_addr.into())?;
-        socket.join_multicast_v4(&multicast_ip, &Ipv4Addr::UNSPECIFIED)?;
-        let socket: std::net::UdpSocket = socket.into();
-        socket.set_nonblocking(true)?;
-        let socket = UdpSocket::from_std(socket)?;
+        let reader_socket = open_multicast_reader(self.propose_addr)?;
+        let writer_socket = open_multicast_writer(self.consensus_addr).await?;
 
-        match self.outbound {
-            SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
-            SocketAddr::V6(_) => panic!("[sequencer] IPv6 multicast requires a different setup"),
-        };
-        let out_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        out_socket.set_multicast_loop_v4(true)?;
-        out_socket.set_multicast_ttl_v4(1)?;
-
-        eprintln!("[sequencer] listening on: {}", self.inbound);
+        eprintln!("[sequencer] listening on: {}", self.propose_addr);
         let mut buf = [0u8; 1024];
         let mut seq_id = 0;
 
         loop {
-            match socket.recv_from(&mut buf).await {
+            match reader_socket.recv_from(&mut buf).await {
                 Ok((amt, src)) => {
                     let payload = String::from_utf8_lossy(&buf[..amt]);
                     eprintln!("[sequencer] received {} bytes from {}: {}", amt, src, payload);
@@ -61,8 +40,8 @@ impl Sequencer {
                     let mut stamped = header_bytes;
                     stamped.extend_from_slice(&buf[..amt]);
 
-                    let bytes_sent = out_socket.send_to(&stamped, self.outbound).await?;
-                    eprintln!("[sequencer] successfully broadcasted {} bytes to multicast topic {}", bytes_sent, self.outbound);
+                    let bytes_sent = writer_socket.send_to(&stamped, self.consensus_addr).await?;
+                    eprintln!("[sequencer] successfully broadcasted {} bytes to multicast topic {}", bytes_sent, self.consensus_addr);
                 }
                 Err(e) => {
                     eprintln!("[sequencer] socket read error: {:?}", e);
