@@ -1,7 +1,10 @@
 use std::sync::Mutex;
 
-use crate::client::{Client, ProcessMessage};
+use serde::{Serialize, Deserialize};
 
+use crate::{client::{Client, ProcessMessage}, error::DiaError, sequencer::Sequencer};
+
+#[derive(Serialize, Deserialize)]
 struct TestMessage {
     msg: String,
 }
@@ -29,11 +32,22 @@ impl ProcessMessage for TestMessageProcessor {
     }
 }
 
-#[test]
-fn test_basic() {
-    let client = Client::new(TestMessageProcessor::new());
+#[tokio::test]
+async fn test_basic() -> Result<(), DiaError> {
+    let local = "239.0.1.1:6000".parse().unwrap();
+    let events = "239.0.1.2:6000".parse().unwrap();
+
+    let sequencer = Sequencer::new(local, events);
+    tokio::spawn(async move { sequencer.start().await });
+    let client = Client::new(local, events, TestMessageProcessor::new());
+
     let msg = String::from("pooper");
-    client.write_message(TestMessage{msg: msg.clone()});
+    client.write_message(TestMessage{msg: msg.clone()}).await?;
     let recv_msg = client.processor.recv.lock().unwrap();
     assert_eq!(*recv_msg, msg);
+
+    // TODO: event driven - this schedules sequencer thread
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+    Ok(())
 }

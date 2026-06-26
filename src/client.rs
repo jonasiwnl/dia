@@ -1,43 +1,46 @@
 use std::net::SocketAddr;
+
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::net::UdpSocket;
 
+use crate::error::DiaError;
+
 pub trait ProcessMessage {
-    type Message;
+    type Message: Serialize + DeserializeOwned + Send + 'static;
     fn create_message(&self, data: String) -> Self::Message;
     fn message_handler(&self, message: Self::Message);
 }
 
 pub struct Client<MessageProcessor> {
     outbound: SocketAddr,
+    events: SocketAddr,
     pub processor: MessageProcessor,
 }
 
 impl<MessageProcessor: ProcessMessage> Client<MessageProcessor> {
-    pub fn new(outbound: SocketAddr, processor: MessageProcessor) -> Self {
+    pub fn new(outbound: SocketAddr, events: SocketAddr, processor: MessageProcessor) -> Self {
         Self {
             outbound,
+            events,
             processor,
         }
     }
 
     // Sends a message to the sequencer, blocks until it receives a response
-    pub async fn write_message(&self, message: <MessageProcessor as ProcessMessage>::Message) -> std::io::Result<()> {
-         let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    pub async fn write_message(&self, message: <MessageProcessor as ProcessMessage>::Message) -> Result<(), DiaError> {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-        // 2. Configure Multicast Time-To-Live (TTL)
-        // 1 = Local subnet only (prevents packets from leaving your local network)
-        // If you are using a virtual network or Docker cluster, you might need to increase this.
-        let (multicast_ip, _) = match self.outbound {
+        match self.outbound {
             SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
-            SocketAddr::V6(_) => panic!("IPv6 multicast requires a different setup"),
+            SocketAddr::V6(_) => panic!("[client] IPv6 multicast requires a different setup"),
         };
-        
-        // Set the TTL so the packet routes correctly as multicast
-        socket.set_multicast_ttl_v4(1)?;
 
-        // 3. Send the raw bytes straight to the multicast SocketAddr
-        let bytes_sent = socket.send_to(message.as_bytes(), self.outbound).await?;
-        eprintln!("Successfully broadcasted {} bytes to multicast topic {}", bytes_sent, self.outbound);
+        // This may need to be increased with more nodes
+        socket.set_multicast_ttl_v4(1)?;
+        socket.set_multicast_loop_v4(true)?;
+
+        let bytes_sent = socket.send_to(&bincode::serialize(&message)?, self.outbound).await?;
+        eprintln!("[client] successfully broadcasted {} bytes to multicast topic {}", bytes_sent, self.outbound);
 
         self.processor.message_handler(message);
 
