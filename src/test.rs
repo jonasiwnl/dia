@@ -45,12 +45,82 @@ async fn test_basic() -> Result<(), DiaError> {
     let msg = String::from("pooper");
     client.write_message(TestMessage { msg: msg.clone() }).await?;
 
-    let _ = rx.recv().await;
     let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("round-trip timed out")
         .expect("channel closed");
 
     assert_eq!(received, msg);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_concurrent() -> Result<(), DiaError> {
+    let propose_addr = "239.0.1.3:6000".parse().unwrap();
+    let consensus_addr = "239.0.1.4:6000".parse().unwrap();
+
+    let sequencer = Sequencer::bind(propose_addr, consensus_addr).await?;
+    tokio::spawn(sequencer.run());
+
+    const NUM_NODES: usize = 10;
+    const MSGS_PER_NODE: usize = 15;
+    const TOTAL: usize = NUM_NODES * MSGS_PER_NODE;
+
+    let mut clients = Vec::with_capacity(NUM_NODES);
+    let mut receivers = Vec::with_capacity(NUM_NODES);
+    for _ in 0..NUM_NODES {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = Arc::new(
+            Client::bind(propose_addr, consensus_addr, TestMessageProcessor { tx }).await?
+        );
+        let listener = Arc::clone(&client);
+        tokio::spawn(async move { listener.listen().await });
+        clients.push(client);
+        receivers.push(rx);
+    }
+
+    let mut writers = Vec::with_capacity(NUM_NODES);
+    for (node_idx, client) in clients.iter().enumerate() {
+        let client = Arc::clone(client);
+        writers.push(tokio::spawn(async move {
+            for msg_idx in 0..MSGS_PER_NODE {
+                client.write_message(TestMessage {
+                    msg: format!("n{}_m{}", node_idx, msg_idx),
+                }).await?;
+            }
+            Ok::<(), DiaError>(())
+        }));
+    }
+    for w in writers {
+        w.await.unwrap()?;
+    }
+
+    let mut observed: Vec<Vec<String>> = Vec::with_capacity(NUM_NODES);
+    for (node_idx, mut rx) in receivers.into_iter().enumerate() {
+        let order = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut v = Vec::with_capacity(TOTAL);
+            for _ in 0..TOTAL {
+                v.push(rx.recv().await.expect("channel closed"));
+            }
+            v
+        })
+        .await
+        .unwrap_or_else(|_| panic!("node {} timed out waiting for consensus messages", node_idx));
+        observed.push(order);
+    }
+
+    let reference = &observed[0];
+    for (i, order) in observed.iter().enumerate().skip(1) {
+        assert_eq!(order, reference, "node {} saw different order than node 0", i);
+    }
+
+    let mut sorted = reference.clone();
+    sorted.sort();
+    let mut expected: Vec<String> = (0..NUM_NODES)
+        .flat_map(|n| (0..MSGS_PER_NODE).map(move |m| format!("n{}_m{}", n, m)))
+        .collect();
+    expected.sort();
+    assert_eq!(sorted, expected, "consensus stream missing or duplicating messages");
+
     Ok(())
 }
