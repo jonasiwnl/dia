@@ -1,31 +1,36 @@
+use std::net::SocketAddr;
+
 use clap::Parser;
 
 use dia::sequencer::Sequencer;
 
-// TODO: --background arg
+// TODO: --background flag
+// #[arg(short, long)]
+// background: bool,
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(short, long)]
+    /// client | sequencer | repair
     service: String,
 
-    // How many of the service to start
-    #[arg(short, long, default_value_t = 1)]
-    count: u8,
+    /// IP + port for propose multicast
+    #[arg(short, long, default_value_t = SocketAddr::from(([239, 0, 1, 1], 6000)))] 
+    propose: SocketAddr,
+
+    /// IP + port for consensus multicast
+    #[arg(short, long, default_value_t = SocketAddr::from(([239, 0, 1, 2], 6000)))]
+    consensus: SocketAddr,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // TODO: make args
-    let propose_addr = "239.0.1.1:6000".parse().unwrap();
-    let consensus_addr = "239.0.1.2:6000".parse().unwrap();
-
     match args.service.as_str() {
-        "client" => {},
+        "client" => {
+        },
         "sequencer" => {
-            let sequencer = Sequencer::bind(propose_addr, consensus_addr).await?;
+            let sequencer = Sequencer::bind(args.propose, args.consensus).await?;
             sequencer.run().await?;
         },
         _ => {
