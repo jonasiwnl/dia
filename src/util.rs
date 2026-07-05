@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, Ipv4Addr};
+use std::net::{Ipv4Addr, SocketAddr};
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;

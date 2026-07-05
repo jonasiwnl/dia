@@ -1,9 +1,15 @@
-use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    net::SocketAddr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 
-use crate::{error::DiaError, util::{open_multicast_reader, open_multicast_writer}};
+use crate::{
+    error::DiaError,
+    util::{open_multicast_reader, open_multicast_writer},
+};
 
 pub struct Sequencer {
     propose_addr: SocketAddr,
@@ -19,10 +25,18 @@ pub struct SequencerHeader {
 }
 
 impl Sequencer {
-    pub async fn bind(propose_addr: SocketAddr, consensus_addr: SocketAddr) -> Result<Self, DiaError> {
+    pub async fn bind(
+        propose_addr: SocketAddr,
+        consensus_addr: SocketAddr,
+    ) -> Result<Self, DiaError> {
         let reader_socket = open_multicast_reader(propose_addr)?;
         let writer_socket = open_multicast_writer(consensus_addr).await?;
-        Ok(Self{ propose_addr, consensus_addr, reader_socket, writer_socket })
+        Ok(Self {
+            propose_addr,
+            consensus_addr,
+            reader_socket,
+            writer_socket,
+        })
     }
 
     pub async fn run(self) -> Result<(), DiaError> {
@@ -34,16 +48,31 @@ impl Sequencer {
             match self.reader_socket.recv_from(&mut buf).await {
                 Ok((amt, src)) => {
                     let payload = String::from_utf8_lossy(&buf[..amt]);
-                    eprintln!("[sequencer] received {} bytes from {}: {}", amt, src, payload);
+                    eprintln!(
+                        "[sequencer] received {} bytes from {}: {}",
+                        amt, src, payload
+                    );
 
-                    let header = SequencerHeader{ seq_id, timestamp_ns: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 };
+                    let header = SequencerHeader {
+                        seq_id,
+                        timestamp_ns: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos() as u64,
+                    };
                     seq_id += 1;
                     let header_bytes = bincode::serialize(&header)?;
                     let mut stamped = header_bytes;
                     stamped.extend_from_slice(&buf[..amt]);
 
-                    let bytes_sent = self.writer_socket.send_to(&stamped, self.consensus_addr).await?;
-                    eprintln!("[sequencer] successfully broadcasted {} bytes to multicast topic {}", bytes_sent, self.consensus_addr);
+                    let bytes_sent = self
+                        .writer_socket
+                        .send_to(&stamped, self.consensus_addr)
+                        .await?;
+                    eprintln!(
+                        "[sequencer] successfully broadcasted {} bytes to multicast topic {}",
+                        bytes_sent, self.consensus_addr
+                    );
                 }
                 Err(e) => {
                     eprintln!("[sequencer] socket read error: {:?}", e);
