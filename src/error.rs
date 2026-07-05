@@ -7,4 +7,7 @@ pub enum DiaError {
 
     #[error("I/O failure: {0}")]
     Network(#[from] std::io::Error),
+
+    #[error("Malformed packet: expected at least {expected} bytes, received {actual}")]
+    MalformedPacket { expected: usize, actual: usize },
 }

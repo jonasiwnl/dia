@@ -1,58 +1,134 @@
-use std::net::SocketAddr;
+use std::{marker::PhantomData, net::SocketAddr};
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::net::UdpSocket;
 
-use crate::{error::DiaError, sequencer::SequencerHeader, util::{open_multicast_reader, open_multicast_writer}};
+use crate::{
+    error::DiaError,
+    sequencer::SequencerHeader,
+    util::{open_multicast_reader, open_multicast_writer},
+};
 
-pub trait ProcessMessage {
-    type Message: Serialize + DeserializeOwned + Send + 'static;
-    fn create_message(&self, data: String) -> Self::Message;
-    fn message_handler(&self, message: Self::Message);
+pub struct Client<Message> {
+    sender: ClientSender<Message>,
+    receiver: ClientReceiver<Message>,
 }
 
-pub struct Client<MessageProcessor> {
+pub struct ClientSender<Message> {
     propose_addr: SocketAddr,
-    consensus_addr: SocketAddr,
-    reader_socket: UdpSocket,
-    writer_socket: UdpSocket,
-    pub processor: MessageProcessor,
+    socket: UdpSocket,
+    _message: PhantomData<Message>,
 }
 
-impl<MessageProcessor: ProcessMessage> Client<MessageProcessor> {
-    pub async fn bind(propose_addr: SocketAddr, consensus_addr: SocketAddr, processor: MessageProcessor) -> Result<Self, DiaError> {
-        let reader_socket = open_multicast_reader(consensus_addr)?;
-        let writer_socket = open_multicast_writer(propose_addr).await?;
-        Ok(Self {
-            propose_addr,
+pub struct ClientReceiver<Message> {
+    consensus_addr: SocketAddr,
+    socket: UdpSocket,
+    _message: PhantomData<Message>,
+}
+
+impl<Message> Client<Message>
+where
+    Message: Serialize + DeserializeOwned,
+{
+    pub async fn bind(
+        propose_addr: SocketAddr,
+        consensus_addr: SocketAddr,
+    ) -> Result<Self, DiaError> {
+        let receiver = ClientReceiver {
             consensus_addr,
-            reader_socket,
-            writer_socket,
-            processor,
-        })
+            socket: open_multicast_reader(consensus_addr)?,
+            _message: PhantomData,
+        };
+        let sender = ClientSender {
+            propose_addr,
+            socket: open_multicast_writer(propose_addr).await?,
+            _message: PhantomData,
+        };
+        Ok(Self { sender, receiver })
     }
 
-    pub async fn write_message(&self, message: <MessageProcessor as ProcessMessage>::Message) -> Result<(), DiaError> {
-        let bytes_sent = self.writer_socket.send_to(&bincode::serialize(&message)?, self.propose_addr).await?;
-        eprintln!("[client] successfully broadcasted {} bytes to multicast topic {}", bytes_sent, self.propose_addr);
+    pub async fn bind_split(
+        propose_addr: SocketAddr,
+        consensus_addr: SocketAddr,
+    ) -> Result<(ClientSender<Message>, ClientReceiver<Message>), DiaError> {
+        Ok(Self::bind(propose_addr, consensus_addr).await?.split())
+    }
+
+    pub fn split(self) -> (ClientSender<Message>, ClientReceiver<Message>) {
+        (self.sender, self.receiver)
+    }
+
+    pub async fn send(&self, message: Message) -> Result<(), DiaError> {
+        self.sender.send(message).await
+    }
+
+    pub async fn recv(&self) -> Result<Message, DiaError> {
+        self.receiver.recv().await
+    }
+
+    pub async fn listen<Handler>(&self, handler: Handler) -> Result<(), DiaError>
+    where
+        Handler: FnMut(Message),
+    {
+        self.receiver.listen(handler).await
+    }
+}
+
+impl<Message> ClientSender<Message>
+where
+    Message: Serialize,
+{
+    pub async fn send(&self, message: Message) -> Result<(), DiaError> {
+        let bytes_sent = self
+            .socket
+            .send_to(&bincode::serialize(&message)?, self.propose_addr)
+            .await?;
+        eprintln!(
+            "[client] successfully broadcasted {} bytes to multicast topic {}",
+            bytes_sent, self.propose_addr
+        );
         Ok(())
     }
+}
 
-    pub async fn listen(&self) -> Result<(), DiaError> {
-        eprintln!("[client] listening on: {}", self.consensus_addr);
+impl<Message> ClientReceiver<Message>
+where
+    Message: DeserializeOwned,
+{
+    pub async fn recv(&self) -> Result<Message, DiaError> {
+        // TODO: adjust buf length, or maybe a param
         let mut buf = [0u8; 1024];
 
-        loop {
-            match self.reader_socket.recv_from(&mut buf).await {
-                Ok((amt, src)) => {
-                    eprintln!("[client] received {} bytes from {}", amt, src);
-                    let (header_bytes, payload) = buf[..amt].split_at(std::mem::size_of::<SequencerHeader>());
-                    let header: SequencerHeader = bincode::deserialize(header_bytes)?;
-                    let message = bincode::deserialize::<MessageProcessor::Message>(payload)?;
-                    self.processor.message_handler(message);
+        match self.socket.recv_from(&mut buf).await {
+            Ok((amt, src)) => {
+                eprintln!("[client] received {} bytes from {}", amt, src);
+                let header_len = std::mem::size_of::<SequencerHeader>();
+                if amt < header_len {
+                    return Err(DiaError::MalformedPacket {
+                        expected: header_len,
+                        actual: amt,
+                    });
                 }
-                Err(e) => eprintln!("[client] recv error: {:?}", e),
+
+                let (header_bytes, payload) = buf[..amt].split_at(header_len);
+                let _header: SequencerHeader = bincode::deserialize(header_bytes)?;
+                let message = bincode::deserialize::<Message>(payload)?;
+                Ok(message)
             }
+            Err(e) => {
+                eprintln!("[client] recv error: {:?}", e);
+                Err(DiaError::Network(e))
+            }
+        }
+    }
+
+    pub async fn listen<Handler>(&self, mut handler: Handler) -> Result<(), DiaError>
+    where
+        Handler: FnMut(Message),
+    {
+        eprintln!("[client] listening on: {}", self.consensus_addr);
+        loop {
+            handler(self.recv().await?);
         }
     }
 }

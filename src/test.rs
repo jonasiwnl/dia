@@ -1,30 +1,13 @@
-use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Serialize, Deserialize};
-use tokio::sync::mpsc::{self, UnboundedSender};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
-use crate::{client::{Client, ProcessMessage}, error::DiaError, sequencer::Sequencer};
+use crate::{client::Client, error::DiaError, sequencer::Sequencer};
 
 #[derive(Serialize, Deserialize)]
 struct TestMessage {
     msg: String,
-}
-
-struct TestMessageProcessor {
-    tx: UnboundedSender<String>,
-}
-
-impl ProcessMessage for TestMessageProcessor {
-    type Message = TestMessage;
-
-    fn create_message(&self, data: String) -> Self::Message {
-        TestMessage { msg: data }
-    }
-
-    fn message_handler(&self, message: Self::Message) {
-        let _ = self.tx.send(message.msg);
-    }
 }
 
 #[tokio::test]
@@ -36,14 +19,18 @@ async fn test_basic() -> Result<(), DiaError> {
     tokio::spawn(sequencer.run());
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Arc::new(
-        Client::bind(propose_addr, consensus_addr, TestMessageProcessor { tx }).await?
-    );
-    let listener = Arc::clone(&client);
-    tokio::spawn(async move { listener.listen().await });
+    let (sender, receiver) =
+        Client::<TestMessage>::bind_split(propose_addr, consensus_addr).await?;
+    tokio::spawn(async move {
+        receiver
+            .listen(move |message| {
+                let _ = tx.send(message.msg);
+            })
+            .await
+    });
 
     let msg = String::from("pooper");
-    client.write_message(TestMessage { msg: msg.clone() }).await?;
+    sender.send(TestMessage { msg: msg.clone() }).await?;
 
     let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -66,27 +53,32 @@ async fn test_concurrent() -> Result<(), DiaError> {
     const MSGS_PER_NODE: usize = 15;
     const TOTAL: usize = NUM_NODES * MSGS_PER_NODE;
 
-    let mut clients = Vec::with_capacity(NUM_NODES);
+    let mut senders = Vec::with_capacity(NUM_NODES);
     let mut receivers = Vec::with_capacity(NUM_NODES);
     for _ in 0..NUM_NODES {
         let (tx, rx) = mpsc::unbounded_channel();
-        let client = Arc::new(
-            Client::bind(propose_addr, consensus_addr, TestMessageProcessor { tx }).await?
-        );
-        let listener = Arc::clone(&client);
-        tokio::spawn(async move { listener.listen().await });
-        clients.push(client);
+        let (sender, receiver) =
+            Client::<TestMessage>::bind_split(propose_addr, consensus_addr).await?;
+        tokio::spawn(async move {
+            receiver
+                .listen(move |message| {
+                    let _ = tx.send(message.msg);
+                })
+                .await
+        });
+        senders.push(sender);
         receivers.push(rx);
     }
 
     let mut writers = Vec::with_capacity(NUM_NODES);
-    for (node_idx, client) in clients.iter().enumerate() {
-        let client = Arc::clone(client);
+    for (node_idx, sender) in senders.into_iter().enumerate() {
         writers.push(tokio::spawn(async move {
             for msg_idx in 0..MSGS_PER_NODE {
-                client.write_message(TestMessage {
-                    msg: format!("n{}_m{}", node_idx, msg_idx),
-                }).await?;
+                sender
+                    .send(TestMessage {
+                        msg: format!("n{}_m{}", node_idx, msg_idx),
+                    })
+                    .await?;
             }
             Ok::<(), DiaError>(())
         }));
@@ -111,7 +103,11 @@ async fn test_concurrent() -> Result<(), DiaError> {
 
     let reference = &observed[0];
     for (i, order) in observed.iter().enumerate().skip(1) {
-        assert_eq!(order, reference, "node {} saw different order than node 0", i);
+        assert_eq!(
+            order, reference,
+            "node {} saw different order than node 0",
+            i
+        );
     }
 
     let mut sorted = reference.clone();
@@ -120,7 +116,10 @@ async fn test_concurrent() -> Result<(), DiaError> {
         .flat_map(|n| (0..MSGS_PER_NODE).map(move |m| format!("n{}_m{}", n, m)))
         .collect();
     expected.sort();
-    assert_eq!(sorted, expected, "consensus stream missing or duplicating messages");
+    assert_eq!(
+        sorted, expected,
+        "consensus stream missing or duplicating messages"
+    );
 
     Ok(())
 }
