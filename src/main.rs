@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
                 Client::<TerminalMessage>::bind_split(args.propose, args.consensus).await?;
             tokio::spawn(async move {
                 if let Err(e) = receiver
-                    .listen(|message| println!("{}", message.data))
+                    .listen(|message| println!("{}", message.payload.data))
                     .await
                 {
                     eprintln!("[client] listener stopped: {:?}", e);

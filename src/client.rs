@@ -26,6 +26,11 @@ pub struct ClientReceiver<Message> {
     _message: PhantomData<Message>,
 }
 
+pub struct SequencedMessage<Message> {
+    pub header: SequencerHeader,
+    pub payload: Message,
+}
+
 impl<Message> Client<Message>
 where
     Message: Serialize + DeserializeOwned,
@@ -62,13 +67,13 @@ where
         self.sender.send(message).await
     }
 
-    pub async fn recv(&self) -> Result<Message, DiaError> {
+    pub async fn recv(&self) -> Result<SequencedMessage<Message>, DiaError> {
         self.receiver.recv().await
     }
 
     pub async fn listen<Handler>(&self, handler: Handler) -> Result<(), DiaError>
     where
-        Handler: FnMut(Message),
+        Handler: FnMut(SequencedMessage<Message>),
     {
         self.receiver.listen(handler).await
     }
@@ -95,7 +100,7 @@ impl<Message> ClientReceiver<Message>
 where
     Message: DeserializeOwned,
 {
-    pub async fn recv(&self) -> Result<Message, DiaError> {
+    pub async fn recv(&self) -> Result<SequencedMessage<Message>, DiaError> {
         // TODO: adjust buf length, or maybe a param
         let mut buf = [0u8; 1024];
 
@@ -111,9 +116,9 @@ where
                 }
 
                 let (header_bytes, payload) = buf[..amt].split_at(header_len);
-                let _header: SequencerHeader = bincode::deserialize(header_bytes)?;
-                let message = bincode::deserialize::<Message>(payload)?;
-                Ok(message)
+                let header = bincode::deserialize(header_bytes)?;
+                let payload = bincode::deserialize(payload)?;
+                Ok(SequencedMessage { header, payload })
             }
             Err(e) => {
                 eprintln!("[client] recv error: {:?}", e);
@@ -124,7 +129,7 @@ where
 
     pub async fn listen<Handler>(&self, mut handler: Handler) -> Result<(), DiaError>
     where
-        Handler: FnMut(Message),
+        Handler: FnMut(SequencedMessage<Message>),
     {
         eprintln!("[client] listening on: {}", self.consensus_addr);
         loop {

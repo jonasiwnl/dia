@@ -24,7 +24,7 @@ async fn test_basic() -> Result<(), DiaError> {
     tokio::spawn(async move {
         receiver
             .listen(move |message| {
-                let _ = tx.send(message.msg);
+                let _ = tx.send(message.payload.msg);
             })
             .await
     });
@@ -62,7 +62,7 @@ async fn test_concurrent() -> Result<(), DiaError> {
         tokio::spawn(async move {
             receiver
                 .listen(move |message| {
-                    let _ = tx.send(message.msg);
+                    let _ = tx.send((message.header.seq_id, message.payload.msg));
                 })
                 .await
         });
@@ -87,7 +87,7 @@ async fn test_concurrent() -> Result<(), DiaError> {
         w.await.unwrap()?;
     }
 
-    let mut observed: Vec<Vec<String>> = Vec::with_capacity(NUM_NODES);
+    let mut observed: Vec<Vec<(u64, String)>> = Vec::with_capacity(NUM_NODES);
     for (node_idx, mut rx) in receivers.into_iter().enumerate() {
         let order = tokio::time::timeout(Duration::from_secs(5), async {
             let mut v = Vec::with_capacity(TOTAL);
@@ -110,7 +110,20 @@ async fn test_concurrent() -> Result<(), DiaError> {
         );
     }
 
-    let mut sorted = reference.clone();
+    let seq_ids = reference
+        .iter()
+        .map(|(seq_id, _)| *seq_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        seq_ids,
+        (0..TOTAL as u64).collect::<Vec<_>>(),
+        "sequencer assigned non-monotonic sequence ids"
+    );
+
+    let mut sorted = reference
+        .iter()
+        .map(|(_, message)| message.clone())
+        .collect::<Vec<_>>();
     sorted.sort();
     let mut expected: Vec<String> = (0..NUM_NODES)
         .flat_map(|n| (0..MSGS_PER_NODE).map(move |m| format!("n{}_m{}", n, m)))

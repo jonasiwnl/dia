@@ -26,8 +26,8 @@ struct ReceivedPacket {
 
 #[derive(Serialize, Deserialize)]
 pub struct SequencerHeader {
-    seq_id: u64,
-    timestamp_ns: u64,
+    pub seq_id: u64,
+    pub timestamp_ns: u64,
 }
 
 impl Sequencer {
