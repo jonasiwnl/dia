@@ -1,7 +1,10 @@
 use std::{marker::PhantomData, net::SocketAddr, sync::Arc};
 
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::{net::UdpSocket, sync::Mutex};
+use tokio::{
+    net::UdpSocket,
+    sync::{Mutex, oneshot},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -16,8 +19,7 @@ pub struct Client<Message> {
 }
 
 struct ClientState {
-    current_msg_id: Option<Uuid>,
-    res: Option<Result<(), DiaError>>,
+    pending: Option<(Uuid, oneshot::Sender<()>)>,
 }
 
 pub struct ClientSender<Message> {
@@ -53,10 +55,7 @@ where
         propose_addr: SocketAddr,
         consensus_addr: SocketAddr,
     ) -> Result<Self, DiaError> {
-        let state = Arc::new(Mutex::new(ClientState {
-            current_msg_id: None,
-            res: None,
-        }));
+        let state = Arc::new(Mutex::new(ClientState { pending: None }));
 
         let receiver = ClientReceiver {
             consensus_addr,
@@ -109,27 +108,32 @@ where
         let socket = self.socket.lock().await;
 
         let msg_id = Uuid::new_v4();
+        let payload = bincode::serialize(&message)?;
+        let (completion_tx, completion_rx) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
-            state.current_msg_id = Some(msg_id);
+            debug_assert!(state.pending.is_none());
+            state.pending = Some((msg_id, completion_tx));
         }
 
-        let payload = bincode::serialize(&message)?;
         let mut proposal = Vec::with_capacity(16 + payload.len());
         proposal.extend_from_slice(msg_id.as_bytes());
         proposal.extend_from_slice(&payload);
-        let bytes_sent = socket.send_to(&proposal, self.propose_addr).await?;
+        let bytes_sent = match socket.send_to(&proposal, self.propose_addr).await {
+            Ok(bytes_sent) => bytes_sent,
+            Err(err) => {
+                self.state.lock().await.pending = None;
+                return Err(err.into());
+            }
+        };
         eprintln!(
             "[client] successfully broadcasted {} bytes to multicast topic {}",
             bytes_sent, self.propose_addr
         );
 
-        let mut state = self.state.lock().await;
-        if let Some(Err(err)) = state.res.take() {
-            return Err(err);
-        }
-
-        Ok(())
+        completion_rx
+            .await
+            .map_err(|_| DiaError::ClientReceiverDropped)
     }
 }
 
@@ -170,14 +174,28 @@ where
     {
         eprintln!("[client] listening on: {}", self.consensus_addr);
         loop {
-            let msg = self.recv().await?;
-            {
-                let mut state = self.state.lock().await;
-                if let Some(current_msg_id) = state.current_msg_id
-                    && current_msg_id == msg.header.msg_id
-                {
-                    state.res = Some(Ok(()));
+            let msg = match self.recv().await {
+                Ok(msg) => msg,
+                Err(err) => {
+                    // Dropping the sender wakes the local send that is awaiting it.
+                    self.state.lock().await.pending = None;
+                    return Err(err);
                 }
+            };
+            let completion_tx = {
+                let mut state = self.state.lock().await;
+                if state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(msg_id, _)| *msg_id == msg.header.msg_id)
+                {
+                    state.pending.take().map(|(_, completion_tx)| completion_tx)
+                } else {
+                    None
+                }
+            };
+            if let Some(completion_tx) = completion_tx {
+                let _ = completion_tx.send(());
             }
             handler(msg);
         }
