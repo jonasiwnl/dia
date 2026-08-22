@@ -32,6 +32,18 @@ pub struct SequencerHeader {
     pub timestamp_ns: u64,
 }
 
+const MESSAGE_ID_LEN: usize = 16;
+
+impl SequencerHeader {
+    pub fn encoded_len() -> Result<usize, DiaError> {
+        Ok(bincode::serialized_size(&Self {
+            msg_id: Uuid::nil(),
+            seq_num: 0,
+            timestamp_ns: 0,
+        })? as usize)
+    }
+}
+
 impl Sequencer {
     pub async fn bind(
         propose_addr: SocketAddr,
@@ -54,19 +66,31 @@ impl Sequencer {
         free_buf_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<(), DiaError> {
         let mut seq_num = 0;
-        let header_len = std::mem::size_of::<SequencerHeader>();
+        let header_len = SequencerHeader::encoded_len()?;
 
         while let Some(mut packet) = rx.recv().await {
+            if packet.payload_len < MESSAGE_ID_LEN {
+                return Err(DiaError::MalformedPacket {
+                    expected: MESSAGE_ID_LEN,
+                    actual: packet.payload_len,
+                });
+            }
+
             // TODO: this should be debug only code
-            let payload = String::from_utf8_lossy(&packet.buf[header_len..][..packet.payload_len]);
+            let payload_start = header_len + MESSAGE_ID_LEN;
+            let payload_end = header_len + packet.payload_len;
+            let payload = String::from_utf8_lossy(&packet.buf[payload_start..payload_end]);
             eprintln!(
                 "[sequencer] received {} bytes from {}: {}",
                 packet.payload_len, packet.src, payload
             );
 
             let mut id_buf = [0u8; 16];
-            id_buf.copy_from_slice(&packet.buf[..16]);
+            id_buf.copy_from_slice(&packet.buf[header_len..payload_start]);
             let msg_id = Uuid::from_bytes(id_buf);
+
+            // Remove the proposal-only message ID; the payload bytes remain unchanged.
+            packet.buf.copy_within(payload_start..payload_end, header_len);
 
             // Stamp the packet with a sequence number and timestamp
             let header = SequencerHeader {
@@ -82,7 +106,7 @@ impl Sequencer {
             packet.buf[..header_len].copy_from_slice(&header_bytes);
 
             // Multicast the stamped packet back
-            let stamped_len = header_len + packet.payload_len;
+            let stamped_len = header_len + packet.payload_len - MESSAGE_ID_LEN;
             let bytes_sent = writer_socket
                 .send_to(&packet.buf[..stamped_len], consensus_addr)
                 .await?;
@@ -107,7 +131,7 @@ impl Sequencer {
         eprintln!("[sequencer] listening on: {}", propose_addr);
         // TODO / PARAM
         let payload_capacity = 1024;
-        let header_len = std::mem::size_of::<SequencerHeader>();
+        let header_len = SequencerHeader::encoded_len()?;
         let buffer_len = header_len + payload_capacity;
         let mut buf = vec![0u8; buffer_len];
         // TODO / PARAM: q size

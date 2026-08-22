@@ -1,7 +1,7 @@
-use std::{marker::PhantomData, net::SocketAddr};
+use std::{marker::PhantomData, net::SocketAddr, sync::Arc};
 
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::{net::UdpSocket, sync::{Mutex, mpsc::{Sender, Receiver, channel}}};
+use tokio::{net::UdpSocket, sync::Mutex};
 use uuid::Uuid;
 
 use crate::{
@@ -15,17 +15,22 @@ pub struct Client<Message> {
     receiver: ClientReceiver<Message>,
 }
 
+struct ClientState {
+    current_msg_id: Option<Uuid>,
+    res: Option<Result<(), DiaError>>,
+}
+
 pub struct ClientSender<Message> {
     propose_addr: SocketAddr,
     socket: Mutex<UdpSocket>,
-    recv_rx: Mutex<Receiver<Result<(), DiaError>>>,
+    state: Arc<Mutex<ClientState>>,
     _message: PhantomData<Message>,
 }
 
 pub struct ClientReceiver<Message> {
     consensus_addr: SocketAddr,
     socket: UdpSocket,
-    recv_tx: Sender<Result<(), DiaError>>,
+    state: Arc<Mutex<ClientState>>,
     _message: PhantomData<Message>,
 }
 
@@ -48,18 +53,18 @@ where
         propose_addr: SocketAddr,
         consensus_addr: SocketAddr,
     ) -> Result<Self, DiaError> {
-        let (tx, rx) = channel::<Result<(), DiaError>>(1);
+        let state = Arc::new(Mutex::new(ClientState{current_msg_id: None, res: None}));
 
         let receiver = ClientReceiver {
             consensus_addr,
             socket: open_multicast_reader(consensus_addr)?,
-            recv_tx: tx,
+            state: Arc::clone(&state),
             _message: PhantomData,
         };
         let sender = ClientSender {
             propose_addr,
             socket: Mutex::new(open_multicast_writer(propose_addr).await?),
-            recv_rx: Mutex::new(rx),
+            state: Arc::clone(&state),
             _message: PhantomData,
         };
         Ok(Self { sender, receiver })
@@ -101,21 +106,25 @@ where
         let socket = self.socket.lock().await;
 
         let msg_id = Uuid::new_v4();
+        {
+            let mut state = self.state.lock().await;
+            state.current_msg_id = Some(msg_id);
+        }
+
         let payload = bincode::serialize(&message)?;
         let mut proposal = Vec::with_capacity(16 + payload.len());
         proposal.extend_from_slice(msg_id.as_bytes());
         proposal.extend_from_slice(&payload);
         let bytes_sent = socket
-            .send_to(&bincode::serialize(&proposal)?, self.propose_addr)
+            .send_to(&proposal, self.propose_addr)
             .await?;
         eprintln!(
             "[client] successfully broadcasted {} bytes to multicast topic {}",
             bytes_sent, self.propose_addr
         );
 
-        let mut recv_rx = self.recv_rx.lock().await;
-        let opt = recv_rx.recv().await;
-        if let Some(res) = opt && let Err(err) = res {
+        let mut state = self.state.lock().await;
+        if let Some(Err(err)) = state.res.take() {
             return Err(err);
         }
 
@@ -134,7 +143,7 @@ where
         match self.socket.recv_from(&mut buf).await {
             Ok((amt, src)) => {
                 eprintln!("[client] received {} bytes from {}", amt, src);
-                let header_len = std::mem::size_of::<SequencerHeader>();
+                let header_len = SequencerHeader::encoded_len()?;
                 if amt < header_len {
                     return Err(DiaError::MalformedPacket {
                         expected: header_len,
@@ -161,8 +170,11 @@ where
         eprintln!("[client] listening on: {}", self.consensus_addr);
         loop {
             let msg = self.recv().await?;
-            if self.recv_tx.send(Ok(())).await.is_err() {
-                return Err(DiaError::ClientSenderDropped);
+            {
+                let mut state = self.state.lock().await;
+                if let Some(current_msg_id) = state.current_msg_id && current_msg_id == msg.header.msg_id {
+                    state.res = Some(Ok(()));
+                }
             }
             handler(msg);
         }
