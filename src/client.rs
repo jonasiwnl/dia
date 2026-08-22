@@ -2,6 +2,7 @@ use std::{marker::PhantomData, net::SocketAddr};
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{net::UdpSocket, sync::{Mutex, mpsc::{Sender, Receiver, channel}}};
+use uuid::Uuid;
 
 use crate::{
     error::DiaError,
@@ -17,7 +18,7 @@ pub struct Client<Message> {
 pub struct ClientSender<Message> {
     propose_addr: SocketAddr,
     socket: Mutex<UdpSocket>,
-    recv_rx: Receiver<Result<(), DiaError>>,
+    recv_rx: Mutex<Receiver<Result<(), DiaError>>>,
     _message: PhantomData<Message>,
 }
 
@@ -28,6 +29,7 @@ pub struct ClientReceiver<Message> {
     _message: PhantomData<Message>,
 }
 
+#[derive(serde::Serialize)]
 pub struct IdentifiedMessage<Message> {
     pub msg_id: uuid::Uuid,
     pub payload: Message,
@@ -57,7 +59,7 @@ where
         let sender = ClientSender {
             propose_addr,
             socket: Mutex::new(open_multicast_writer(propose_addr).await?),
-            recv_rx: rx,
+            recv_rx: Mutex::new(rx),
             _message: PhantomData,
         };
         Ok(Self { sender, receiver })
@@ -74,7 +76,7 @@ where
         (self.sender, self.receiver)
     }
 
-    pub async fn send(&mut self, message: Message) -> Result<(), DiaError> {
+    pub async fn send(&self, message: Message) -> Result<(), DiaError> {
         self.sender.send(message).await
     }
 
@@ -95,19 +97,24 @@ where
     Message: Serialize,
 {
     // Thread safe, blocking send
-    pub async fn send(&mut self, message: Message) -> Result<(), DiaError> {
+    pub async fn send(&self, message: Message) -> Result<(), DiaError> {
         let socket = self.socket.lock().await;
 
+        let msg_id = Uuid::new_v4();
+        let payload = bincode::serialize(&message)?;
+        let mut proposal = Vec::with_capacity(16 + payload.len());
+        proposal.extend_from_slice(msg_id.as_bytes());
+        proposal.extend_from_slice(&payload);
         let bytes_sent = socket
-            .send_to(&bincode::serialize(&message)?, self.propose_addr)
+            .send_to(&bincode::serialize(&proposal)?, self.propose_addr)
             .await?;
         eprintln!(
             "[client] successfully broadcasted {} bytes to multicast topic {}",
             bytes_sent, self.propose_addr
         );
 
-        // TODO: really, we should hold a mutex around this
-        let opt = self.recv_rx.recv().await;
+        let mut recv_rx = self.recv_rx.lock().await;
+        let opt = recv_rx.recv().await;
         if let Some(res) = opt && let Err(err) = res {
             return Err(err);
         }
@@ -154,8 +161,8 @@ where
         eprintln!("[client] listening on: {}", self.consensus_addr);
         loop {
             let msg = self.recv().await?;
-            if let Err(err) = self.recv_tx.send(Ok(())).await {
-                return Err(err);
+            if self.recv_tx.send(Ok(())).await.is_err() {
+                return Err(DiaError::ClientSenderDropped);
             }
             handler(msg);
         }

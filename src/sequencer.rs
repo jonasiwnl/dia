@@ -5,6 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::{net::UdpSocket, sync::mpsc};
+use uuid::Uuid;
 
 use crate::{
     error::DiaError,
@@ -26,6 +27,7 @@ struct ReceivedPacket {
 
 #[derive(Serialize, Deserialize)]
 pub struct SequencerHeader {
+    pub msg_id: Uuid,
     pub seq_num: u64,
     pub timestamp_ns: u64,
 }
@@ -55,14 +57,20 @@ impl Sequencer {
         let header_len = std::mem::size_of::<SequencerHeader>();
 
         while let Some(mut packet) = rx.recv().await {
+            // TODO: this should be debug only code
             let payload = String::from_utf8_lossy(&packet.buf[header_len..][..packet.payload_len]);
             eprintln!(
                 "[sequencer] received {} bytes from {}: {}",
                 packet.payload_len, packet.src, payload
             );
 
+            let mut id_buf = [0u8; 16];
+            id_buf.copy_from_slice(&packet.buf[..16]);
+            let msg_id = Uuid::from_bytes(id_buf);
+
             // Stamp the packet with a sequence number and timestamp
             let header = SequencerHeader {
+                msg_id,
                 seq_num,
                 timestamp_ns: SystemTime::now()
                     .duration_since(UNIX_EPOCH)

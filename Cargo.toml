@@ -11,4 +11,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 socket2 = { version = "0.6.4", features = ["all"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
-uuid = { version = "1.25.0", features = ["v4", "fast-rng"] }
+uuid = { version = "1.25.0", features = ["v4", "fast-rng", "serde"] }

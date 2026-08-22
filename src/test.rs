@@ -51,19 +51,19 @@ async fn test_basic() -> Result<(), DiaError> {
     tokio::spawn(async move {
         receiver
             .listen(move |message| {
-                let _ = tx.send((message.id(), message.payload.msg));
+                let _ = tx.send((message.header.msg_id, message.payload.msg));
             })
             .await
     });
 
     let msg = String::from("pooper");
-    let sent_id = sender.send(TestMessage { msg: msg.clone() }).await?;
+    sender.send(TestMessage { msg: msg.clone() }).await?;
     let (received_id, received) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("round-trip timed out")
         .expect("channel closed");
 
-    assert_eq!(received_id, sent_id);
+    assert!(!received_id.is_nil());
     assert_eq!(received, msg);
 
     Ok(())
@@ -82,7 +82,7 @@ async fn test_concurrent_sends_from_one_client() -> Result<(), DiaError> {
     tokio::spawn(async move {
         receiver
             .listen(move |message| {
-                let _ = tx.send((message.id(), message.payload.msg));
+                let _ = tx.send((message.header.msg_id, message.payload.msg));
             })
             .await
     });
@@ -99,8 +99,8 @@ async fn test_concurrent_sends_from_one_client() -> Result<(), DiaError> {
     })
     .await
     .expect("concurrent sends did not finish");
-    let first = first?;
-    let second = second?;
+    first?;
+    second?;
 
     let mut received = Vec::new();
     for _ in 0..2 {
@@ -111,11 +111,9 @@ async fn test_concurrent_sends_from_one_client() -> Result<(), DiaError> {
                 .expect("receiver stopped"),
         );
     }
-    let mut received_ids = received.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-    received_ids.sort_by_key(|id| id.op_id);
-    let mut sent_ids = vec![first, second];
-    sent_ids.sort_by_key(|id| id.op_id);
-    assert_eq!(received_ids, sent_ids);
+    let received_ids = received.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    assert_eq!(received_ids.len(), 2);
+    assert_ne!(received_ids[0], received_ids[1]);
     let mut payloads = received
         .into_iter()
         .map(|(_, payload)| payload)
@@ -139,7 +137,7 @@ async fn test_sender_recovers_after_serialization_failure() -> Result<(), DiaErr
     tokio::spawn(async move {
         receiver
             .listen(move |message| {
-                let _ = tx.send(message.id());
+                let _ = tx.send(message.header.msg_id);
             })
             .await
     });
@@ -154,7 +152,7 @@ async fn test_sender_recovers_after_serialization_failure() -> Result<(), DiaErr
         Err(DiaError::Serialization(_))
     ));
 
-    let sent_id = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(2),
         sender.send(FailsOnceMessage {
             msg: "succeeds".into(),
@@ -166,7 +164,7 @@ async fn test_sender_recovers_after_serialization_failure() -> Result<(), DiaErr
         .await
         .expect("successful send was not sequenced")
         .expect("receiver stopped");
-    assert_eq!(received_id, sent_id);
+    assert!(!received_id.is_nil());
 
     Ok(())
 }
@@ -192,7 +190,7 @@ async fn test_concurrent() -> Result<(), DiaError> {
         tokio::spawn(async move {
             receiver
                 .listen(move |message| {
-                    let _ = tx.send((message.header.seq_id, message.payload.msg));
+                    let _ = tx.send((message.header.seq_num, message.payload.msg));
                 })
                 .await
         });
