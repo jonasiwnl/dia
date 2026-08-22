@@ -90,7 +90,9 @@ impl Sequencer {
             let msg_id = Uuid::from_bytes(id_buf);
 
             // Remove the proposal-only message ID; the payload bytes remain unchanged.
-            packet.buf.copy_within(payload_start..payload_end, header_len);
+            packet
+                .buf
+                .copy_within(payload_start..payload_end, header_len);
 
             // Stamp the packet with a sequence number and timestamp
             let header = SequencerHeader {

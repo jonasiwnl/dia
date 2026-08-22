@@ -53,7 +53,10 @@ where
         propose_addr: SocketAddr,
         consensus_addr: SocketAddr,
     ) -> Result<Self, DiaError> {
-        let state = Arc::new(Mutex::new(ClientState{current_msg_id: None, res: None}));
+        let state = Arc::new(Mutex::new(ClientState {
+            current_msg_id: None,
+            res: None,
+        }));
 
         let receiver = ClientReceiver {
             consensus_addr,
@@ -115,9 +118,7 @@ where
         let mut proposal = Vec::with_capacity(16 + payload.len());
         proposal.extend_from_slice(msg_id.as_bytes());
         proposal.extend_from_slice(&payload);
-        let bytes_sent = socket
-            .send_to(&proposal, self.propose_addr)
-            .await?;
+        let bytes_sent = socket.send_to(&proposal, self.propose_addr).await?;
         eprintln!(
             "[client] successfully broadcasted {} bytes to multicast topic {}",
             bytes_sent, self.propose_addr
@@ -172,7 +173,9 @@ where
             let msg = self.recv().await?;
             {
                 let mut state = self.state.lock().await;
-                if let Some(current_msg_id) = state.current_msg_id && current_msg_id == msg.header.msg_id {
+                if let Some(current_msg_id) = state.current_msg_id
+                    && current_msg_id == msg.header.msg_id
+                {
                     state.res = Some(Ok(()));
                 }
             }
