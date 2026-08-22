@@ -94,11 +94,12 @@ impl Sequencer {
             writer_socket,
         } = self;
         eprintln!("[sequencer] listening on: {}", propose_addr);
+        // TODO / PARAM
         let payload_capacity = 1024;
         let header_len = std::mem::size_of::<SequencerHeader>();
         let buffer_len = header_len + payload_capacity;
         let mut buf = vec![0u8; buffer_len];
-        // TODO: q size should be variable
+        // TODO / PARAM: q size
         let (sink_tx, sink_rx) = mpsc::channel::<ReceivedPacket>(50);
         let (free_buf_tx, mut free_buf_rx) = mpsc::channel::<Vec<u8>>(50);
 

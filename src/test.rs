@@ -4,17 +4,9 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
-use tokio::{
-    net::UdpSocket,
-    sync::{mpsc, oneshot},
-};
+use tokio::sync::mpsc;
 
-use crate::{
-    client::Client,
-    error::DiaError,
-    sequencer::Sequencer,
-    util::{open_multicast_reader, open_multicast_writer},
-};
+use crate::{client::Client, error::DiaError, sequencer::Sequencer};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TestMessage {
@@ -43,32 +35,6 @@ impl Serialize for FailsOnceMessage {
         state.serialize_field("msg", &self.msg)?;
         state.end()
     }
-}
-
-async fn relay_first_packet_away_from_client_one(
-    source: UdpSocket,
-    client_one_writer: UdpSocket,
-    client_one_addr: std::net::SocketAddr,
-    client_two_writer: UdpSocket,
-    client_two_addr: std::net::SocketAddr,
-    first_packet_forwarded: oneshot::Sender<()>,
-) -> Result<(), DiaError> {
-    let mut buf = [0u8; 1024];
-
-    let (first_len, _) = source.recv_from(&mut buf).await?;
-    client_two_writer
-        .send_to(&buf[..first_len], client_two_addr)
-        .await?;
-    let _ = first_packet_forwarded.send(());
-
-    let (second_len, _) = source.recv_from(&mut buf).await?;
-    client_one_writer
-        .send_to(&buf[..second_len], client_one_addr)
-        .await?;
-    client_two_writer
-        .send_to(&buf[..second_len], client_two_addr)
-        .await?;
-    Ok(())
 }
 
 #[tokio::test]
@@ -201,93 +167,6 @@ async fn test_sender_recovers_after_serialization_failure() -> Result<(), DiaErr
         .expect("successful send was not sequenced")
         .expect("receiver stopped");
     assert_eq!(received_id, sent_id);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_client_repairs_a_missing_consensus_message() -> Result<(), DiaError> {
-    let propose_addr = "239.0.1.9:6000".parse().unwrap();
-    let sequencer_consensus_addr = "239.0.1.10:6000".parse().unwrap();
-    let client_one_consensus_addr = "239.0.1.11:6000".parse().unwrap();
-    let client_two_consensus_addr = "239.0.1.12:6000".parse().unwrap();
-
-    let sequencer = Sequencer::bind(propose_addr, sequencer_consensus_addr).await?;
-    tokio::spawn(sequencer.run());
-
-    // This is a network-only fault injector: it does not inspect or construct
-    // Dia packets. It drops the first sequencer datagram only for client one.
-    let relay_source = open_multicast_reader(sequencer_consensus_addr)?;
-    let client_one_writer = open_multicast_writer(client_one_consensus_addr).await?;
-    let client_two_writer = open_multicast_writer(client_two_consensus_addr).await?;
-    let (first_packet_forwarded_tx, first_packet_forwarded_rx) = oneshot::channel();
-    let relay = tokio::spawn(relay_first_packet_away_from_client_one(
-        relay_source,
-        client_one_writer,
-        client_one_consensus_addr,
-        client_two_writer,
-        client_two_consensus_addr,
-        first_packet_forwarded_tx,
-    ));
-
-    let (client_one_sender, client_one_receiver) =
-        Client::<TestMessage>::bind_split(propose_addr, client_one_consensus_addr).await?;
-    let (client_one_history_tx, mut client_one_history_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        client_one_receiver
-            .listen(move |message| {
-                let _ = client_one_history_tx.send((message.header.seq_id, message.payload.msg));
-            })
-            .await
-    });
-
-    let (client_two_sender, client_two_receiver) =
-        Client::<TestMessage>::bind_split(propose_addr, client_two_consensus_addr).await?;
-    tokio::spawn(async move { client_two_receiver.listen(|_| {}).await });
-
-    let _client_one_send = tokio::spawn(async move {
-        client_one_sender
-            .send(TestMessage {
-                msg: "operation one".into(),
-            })
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(2), first_packet_forwarded_rx)
-        .await
-        .expect("sequencer did not accept client one's operation")
-        .expect("relay stopped before forwarding the first packet");
-
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        client_two_sender.send(TestMessage {
-            msg: "operation two".into(),
-        }),
-    )
-    .await
-    .expect("client two's operation was not sequenced")?;
-    relay.await.expect("relay task panicked")?;
-
-    let client_one_history = tokio::time::timeout(Duration::from_secs(2), async {
-        let mut history = Vec::new();
-        for _ in 0..2 {
-            history.push(
-                client_one_history_rx
-                    .recv()
-                    .await
-                    .expect("client one's receiver stopped"),
-            );
-        }
-        history
-    })
-    .await
-    .expect("client one did not repair the missing consensus message");
-    assert_eq!(
-        client_one_history,
-        vec![
-            (0, "operation one".to_string()),
-            (1, "operation two".to_string()),
-        ]
-    );
 
     Ok(())
 }

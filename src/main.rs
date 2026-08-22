@@ -10,9 +10,9 @@ struct TerminalMessage {
     data: String,
 }
 
-// TODO: --background flag
+// TODO: --daemon flag
 // #[arg(short, long)]
-// background: bool,
+// daemon: bool,
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {

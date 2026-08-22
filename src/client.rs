@@ -101,7 +101,7 @@ where
     Message: DeserializeOwned,
 {
     pub async fn recv(&self) -> Result<SequencedMessage<Message>, DiaError> {
-        // TODO: adjust buf length, or maybe a param
+        // TODO / PARAM: buf length
         let mut buf = [0u8; 1024];
 
         match self.socket.recv_from(&mut buf).await {
