@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, net::SocketAddr};
 
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, sync::{Mutex, mpsc::{Sender, Receiver, channel}}};
 
 use crate::{
     error::DiaError,
@@ -16,14 +16,21 @@ pub struct Client<Message> {
 
 pub struct ClientSender<Message> {
     propose_addr: SocketAddr,
-    socket: UdpSocket,
+    socket: Mutex<UdpSocket>,
+    recv_rx: Receiver<Result<(), DiaError>>,
     _message: PhantomData<Message>,
 }
 
 pub struct ClientReceiver<Message> {
     consensus_addr: SocketAddr,
     socket: UdpSocket,
+    recv_tx: Sender<Result<(), DiaError>>,
     _message: PhantomData<Message>,
+}
+
+pub struct IdentifiedMessage<Message> {
+    pub msg_id: uuid::Uuid,
+    pub payload: Message,
 }
 
 pub struct SequencedMessage<Message> {
@@ -39,14 +46,18 @@ where
         propose_addr: SocketAddr,
         consensus_addr: SocketAddr,
     ) -> Result<Self, DiaError> {
+        let (tx, rx) = channel::<Result<(), DiaError>>(1);
+
         let receiver = ClientReceiver {
             consensus_addr,
             socket: open_multicast_reader(consensus_addr)?,
+            recv_tx: tx,
             _message: PhantomData,
         };
         let sender = ClientSender {
             propose_addr,
-            socket: open_multicast_writer(propose_addr).await?,
+            socket: Mutex::new(open_multicast_writer(propose_addr).await?),
+            recv_rx: rx,
             _message: PhantomData,
         };
         Ok(Self { sender, receiver })
@@ -63,7 +74,7 @@ where
         (self.sender, self.receiver)
     }
 
-    pub async fn send(&self, message: Message) -> Result<(), DiaError> {
+    pub async fn send(&mut self, message: Message) -> Result<(), DiaError> {
         self.sender.send(message).await
     }
 
@@ -83,15 +94,24 @@ impl<Message> ClientSender<Message>
 where
     Message: Serialize,
 {
-    pub async fn send(&self, message: Message) -> Result<(), DiaError> {
-        let bytes_sent = self
-            .socket
+    // Thread safe, blocking send
+    pub async fn send(&mut self, message: Message) -> Result<(), DiaError> {
+        let socket = self.socket.lock().await;
+
+        let bytes_sent = socket
             .send_to(&bincode::serialize(&message)?, self.propose_addr)
             .await?;
         eprintln!(
             "[client] successfully broadcasted {} bytes to multicast topic {}",
             bytes_sent, self.propose_addr
         );
+
+        // TODO: really, we should hold a mutex around this
+        let opt = self.recv_rx.recv().await;
+        if let Some(res) = opt && let Err(err) = res {
+            return Err(err);
+        }
+
         Ok(())
     }
 }
@@ -133,7 +153,11 @@ where
     {
         eprintln!("[client] listening on: {}", self.consensus_addr);
         loop {
-            handler(self.recv().await?);
+            let msg = self.recv().await?;
+            if let Err(err) = self.recv_tx.send(Ok(())).await {
+                return Err(err);
+            }
+            handler(msg);
         }
     }
 }

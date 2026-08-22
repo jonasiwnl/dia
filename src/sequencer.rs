@@ -26,7 +26,7 @@ struct ReceivedPacket {
 
 #[derive(Serialize, Deserialize)]
 pub struct SequencerHeader {
-    pub seq_id: u64,
+    pub seq_num: u64,
     pub timestamp_ns: u64,
 }
 
@@ -51,7 +51,7 @@ impl Sequencer {
         mut rx: mpsc::Receiver<ReceivedPacket>,
         free_buf_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<(), DiaError> {
-        let mut seq_id = 0;
+        let mut seq_num = 0;
         let header_len = std::mem::size_of::<SequencerHeader>();
 
         while let Some(mut packet) = rx.recv().await {
@@ -60,17 +60,20 @@ impl Sequencer {
                 "[sequencer] received {} bytes from {}: {}",
                 packet.payload_len, packet.src, payload
             );
+
+            // Stamp the packet with a sequence number and timestamp
             let header = SequencerHeader {
-                seq_id,
+                seq_num,
                 timestamp_ns: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_nanos() as u64,
             };
-            seq_id += 1;
+            seq_num += 1;
             let header_bytes = bincode::serialize(&header)?;
             packet.buf[..header_len].copy_from_slice(&header_bytes);
 
+            // Multicast the stamped packet back
             let stamped_len = header_len + packet.payload_len;
             let bytes_sent = writer_socket
                 .send_to(&packet.buf[..stamped_len], consensus_addr)
