@@ -1,27 +1,27 @@
 use std::{
     net::SocketAddr,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
     error::DiaError,
-    util::{open_multicast_reader, open_multicast_writer},
+    network::{DatagramReceiver, DatagramSender, UdpMulticastReceiver, UdpMulticastSender},
 };
 
 pub struct Sequencer {
     propose_addr: SocketAddr,
     consensus_addr: SocketAddr,
-    reader_socket: UdpSocket,
-    writer_socket: UdpSocket,
+    reader: Arc<dyn DatagramReceiver>,
+    writer: Arc<dyn DatagramSender>,
 }
 
 struct ReceivedPacket {
-    buf: Vec<u8>,
-    payload_len: usize,
+    bytes: Vec<u8>,
     src: SocketAddr,
 }
 
@@ -45,54 +45,62 @@ impl SequencerHeader {
 }
 
 impl Sequencer {
+    pub fn from_transport(
+        propose_addr: SocketAddr,
+        consensus_addr: SocketAddr,
+        proposal_receiver: Arc<dyn DatagramReceiver>,
+        consensus_sender: Arc<dyn DatagramSender>,
+    ) -> Self {
+        Self {
+            propose_addr,
+            consensus_addr,
+            reader: proposal_receiver,
+            writer: consensus_sender,
+        }
+    }
+}
+
+impl Sequencer {
     pub async fn bind(
         propose_addr: SocketAddr,
         consensus_addr: SocketAddr,
     ) -> Result<Self, DiaError> {
-        let reader_socket = open_multicast_reader(propose_addr)?;
-        let writer_socket = open_multicast_writer(consensus_addr).await?;
-        Ok(Self {
+        Ok(Self::from_transport(
             propose_addr,
             consensus_addr,
-            reader_socket,
-            writer_socket,
-        })
+            Arc::new(UdpMulticastReceiver::bind(propose_addr)?),
+            Arc::new(UdpMulticastSender::bind(consensus_addr).await?),
+        ))
     }
 
     async fn sink(
         consensus_addr: SocketAddr,
-        writer_socket: UdpSocket,
+        writer: Arc<dyn DatagramSender>,
         mut rx: mpsc::Receiver<ReceivedPacket>,
-        free_buf_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<(), DiaError> {
         let mut seq_num = 0;
         let header_len = SequencerHeader::encoded_len()?;
 
-        while let Some(mut packet) = rx.recv().await {
-            if packet.payload_len < MESSAGE_ID_LEN {
+        while let Some(packet) = rx.recv().await {
+            if packet.bytes.len() < MESSAGE_ID_LEN {
                 return Err(DiaError::MalformedPacket {
                     expected: MESSAGE_ID_LEN,
-                    actual: packet.payload_len,
+                    actual: packet.bytes.len(),
                 });
             }
 
             // TODO: this should be debug only code
-            let payload_start = header_len + MESSAGE_ID_LEN;
-            let payload_end = header_len + packet.payload_len;
-            let payload = String::from_utf8_lossy(&packet.buf[payload_start..payload_end]);
+            let payload = String::from_utf8_lossy(&packet.bytes[MESSAGE_ID_LEN..]);
             eprintln!(
                 "[sequencer] received {} bytes from {}: {}",
-                packet.payload_len, packet.src, payload
+                packet.bytes.len(),
+                packet.src,
+                payload
             );
 
             let mut id_buf = [0u8; 16];
-            id_buf.copy_from_slice(&packet.buf[header_len..payload_start]);
+            id_buf.copy_from_slice(&packet.bytes[..MESSAGE_ID_LEN]);
             let msg_id = Uuid::from_bytes(id_buf);
-
-            // Remove the proposal-only message ID; the payload bytes remain unchanged.
-            packet
-                .buf
-                .copy_within(payload_start..payload_end, header_len);
 
             // Stamp the packet with a sequence number and timestamp
             let header = SequencerHeader {
@@ -105,19 +113,17 @@ impl Sequencer {
             };
             seq_num += 1;
             let header_bytes = bincode::serialize(&header)?;
-            packet.buf[..header_len].copy_from_slice(&header_bytes);
+            debug_assert_eq!(header_bytes.len(), header_len);
+            let mut stamped = Vec::with_capacity(header_len + packet.bytes.len() - MESSAGE_ID_LEN);
+            stamped.extend_from_slice(&header_bytes);
+            stamped.extend_from_slice(&packet.bytes[MESSAGE_ID_LEN..]);
 
             // Multicast the stamped packet back
-            let stamped_len = header_len + packet.payload_len - MESSAGE_ID_LEN;
-            let bytes_sent = writer_socket
-                .send_to(&packet.buf[..stamped_len], consensus_addr)
-                .await?;
+            let bytes_sent = writer.send(stamped).await?;
             eprintln!(
                 "[sequencer] successfully broadcasted {} bytes to multicast topic {}",
                 bytes_sent, consensus_addr
             );
-
-            let _ = free_buf_tx.try_send(packet.buf);
         }
 
         Ok(())
@@ -127,41 +133,30 @@ impl Sequencer {
         let Sequencer {
             propose_addr,
             consensus_addr,
-            reader_socket,
-            writer_socket,
+            reader,
+            writer,
         } = self;
         eprintln!("[sequencer] listening on: {}", propose_addr);
-        // TODO / PARAM
-        let payload_capacity = 1024;
-        let header_len = SequencerHeader::encoded_len()?;
-        let buffer_len = header_len + payload_capacity;
-        let mut buf = vec![0u8; buffer_len];
         // TODO / PARAM: q size
         let (sink_tx, sink_rx) = mpsc::channel::<ReceivedPacket>(50);
-        let (free_buf_tx, mut free_buf_rx) = mpsc::channel::<Vec<u8>>(50);
 
         tokio::spawn(async move {
-            if let Err(e) = Self::sink(consensus_addr, writer_socket, sink_rx, free_buf_tx).await {
+            if let Err(e) = Self::sink(consensus_addr, writer, sink_rx).await {
                 eprintln!("[sequencer] sink error: {:?}", e);
             }
         });
 
         loop {
-            match reader_socket.recv_from(&mut buf[header_len..]).await {
-                Ok((amt, src)) => {
+            match reader.recv().await {
+                Ok(packet) => {
                     let packet = ReceivedPacket {
-                        buf,
-                        payload_len: amt,
-                        src,
+                        bytes: packet.bytes,
+                        src: packet.src,
                     };
                     if sink_tx.send(packet).await.is_err() {
                         eprintln!("[sequencer] sink closed");
                         break;
                     }
-
-                    buf = free_buf_rx
-                        .try_recv()
-                        .unwrap_or_else(|_| vec![0u8; buffer_len]);
                 }
                 Err(e) => {
                     eprintln!("[sequencer] socket read error: {:?}", e);

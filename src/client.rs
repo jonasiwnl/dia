@@ -1,16 +1,13 @@
 use std::{marker::PhantomData, net::SocketAddr, sync::Arc};
 
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::{
-    net::UdpSocket,
-    sync::{Mutex, oneshot},
-};
+use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 
 use crate::{
     error::DiaError,
+    network::{DatagramReceiver, DatagramSender, UdpMulticastReceiver, UdpMulticastSender},
     sequencer::SequencerHeader,
-    util::{open_multicast_reader, open_multicast_writer},
 };
 
 pub struct Client<Message> {
@@ -24,14 +21,15 @@ struct ClientState {
 
 pub struct ClientSender<Message> {
     propose_addr: SocketAddr,
-    socket: Mutex<UdpSocket>,
+    send_lock: Mutex<()>,
+    network: Arc<dyn DatagramSender>,
     state: Arc<Mutex<ClientState>>,
     _message: PhantomData<Message>,
 }
 
 pub struct ClientReceiver<Message> {
     consensus_addr: SocketAddr,
-    socket: UdpSocket,
+    network: Arc<dyn DatagramReceiver>,
     state: Arc<Mutex<ClientState>>,
     _message: PhantomData<Message>,
 }
@@ -47,6 +45,31 @@ pub struct SequencedMessage<Message> {
     pub payload: Message,
 }
 
+impl<Message> Client<Message> {
+    pub fn from_transport(
+        propose_addr: SocketAddr,
+        consensus_addr: SocketAddr,
+        proposal_sender: Arc<dyn DatagramSender>,
+        consensus_receiver: Arc<dyn DatagramReceiver>,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(ClientState { pending: None }));
+        let receiver = ClientReceiver {
+            consensus_addr,
+            network: consensus_receiver,
+            state: Arc::clone(&state),
+            _message: PhantomData,
+        };
+        let sender = ClientSender {
+            propose_addr,
+            send_lock: Mutex::new(()),
+            network: proposal_sender,
+            state,
+            _message: PhantomData,
+        };
+        Self { sender, receiver }
+    }
+}
+
 impl<Message> Client<Message>
 where
     Message: Serialize + DeserializeOwned,
@@ -55,21 +78,12 @@ where
         propose_addr: SocketAddr,
         consensus_addr: SocketAddr,
     ) -> Result<Self, DiaError> {
-        let state = Arc::new(Mutex::new(ClientState { pending: None }));
-
-        let receiver = ClientReceiver {
-            consensus_addr,
-            socket: open_multicast_reader(consensus_addr)?,
-            state: Arc::clone(&state),
-            _message: PhantomData,
-        };
-        let sender = ClientSender {
+        Ok(Self::from_transport(
             propose_addr,
-            socket: Mutex::new(open_multicast_writer(propose_addr).await?),
-            state: Arc::clone(&state),
-            _message: PhantomData,
-        };
-        Ok(Self { sender, receiver })
+            consensus_addr,
+            Arc::new(UdpMulticastSender::bind(propose_addr).await?),
+            Arc::new(UdpMulticastReceiver::bind(consensus_addr)?),
+        ))
     }
 
     pub async fn bind_split(
@@ -105,7 +119,7 @@ where
 {
     // Thread safe, blocking send
     pub async fn send(&self, message: Message) -> Result<(), DiaError> {
-        let socket = self.socket.lock().await;
+        let _send_guard = self.send_lock.lock().await;
 
         let msg_id = Uuid::new_v4();
         let payload = bincode::serialize(&message)?;
@@ -119,7 +133,7 @@ where
         let mut proposal = Vec::with_capacity(16 + payload.len());
         proposal.extend_from_slice(msg_id.as_bytes());
         proposal.extend_from_slice(&payload);
-        let bytes_sent = match socket.send_to(&proposal, self.propose_addr).await {
+        let bytes_sent = match self.network.send(proposal).await {
             Ok(bytes_sent) => bytes_sent,
             Err(err) => {
                 self.state.lock().await.pending = None;
@@ -142,11 +156,10 @@ where
     Message: DeserializeOwned,
 {
     pub async fn recv(&self) -> Result<SequencedMessage<Message>, DiaError> {
-        // TODO / PARAM: buf length
-        let mut buf = [0u8; 1024];
-
-        match self.socket.recv_from(&mut buf).await {
-            Ok((amt, src)) => {
+        match self.network.recv().await {
+            Ok(packet) => {
+                let amt = packet.bytes.len();
+                let src = packet.src;
                 eprintln!("[client] received {} bytes from {}", amt, src);
                 let header_len = SequencerHeader::encoded_len()?;
                 if amt < header_len {
@@ -156,7 +169,7 @@ where
                     });
                 }
 
-                let (header_bytes, payload) = buf[..amt].split_at(header_len);
+                let (header_bytes, payload) = packet.bytes.split_at(header_len);
                 let header = bincode::deserialize(header_bytes)?;
                 let payload = bincode::deserialize(payload)?;
                 Ok(SequencedMessage { header, payload })

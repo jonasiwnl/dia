@@ -6,7 +6,12 @@ use std::{
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use tokio::sync::mpsc;
 
-use crate::{client::Client, error::DiaError, sequencer::Sequencer};
+use crate::{
+    client::Client,
+    error::DiaError,
+    network::testing::{NetworkChange, Node, SimulatedNetwork},
+    sequencer::Sequencer,
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TestMessage {
@@ -35,6 +40,48 @@ impl Serialize for FailsOnceMessage {
         state.serialize_field("msg", &self.msg)?;
         state.end()
     }
+}
+
+#[tokio::test]
+async fn test_pending_send_fails_when_consensus_receiver_fails() {
+    let propose_addr = "239.0.1.9:6000".parse().unwrap();
+    let consensus_addr = "239.0.1.10:6000".parse().unwrap();
+    let network = SimulatedNetwork::new();
+    let transport = network.client(1);
+
+    let client = Client::<TestMessage>::from_transport(
+        propose_addr,
+        consensus_addr,
+        transport.proposal_sender(),
+        transport.consensus_receiver(),
+    );
+    let (sender, receiver) = client.split();
+    let listener = tokio::spawn(async move { receiver.listen(|_| {}).await });
+
+    let send = tokio::spawn(async move {
+        sender
+            .send(TestMessage {
+                msg: "will fail".into(),
+            })
+            .await
+    });
+    network
+        .wait_for_transmission(Node::Client(1), Node::Sequencer)
+        .await;
+    network.apply(NetworkChange::fail_inbound(
+        Node::Client(1),
+        std::io::ErrorKind::ConnectionReset,
+    ));
+
+    let result = tokio::time::timeout(Duration::from_secs(1), send)
+        .await
+        .expect("send hung after an injected receiver failure")
+        .expect("send task panicked");
+    assert!(
+        matches!(result, Err(DiaError::Network(ref error)) if error.kind() == std::io::ErrorKind::ConnectionReset)
+    );
+
+    assert!(matches!(listener.await.unwrap(), Err(DiaError::Network(_))));
 }
 
 #[tokio::test]
