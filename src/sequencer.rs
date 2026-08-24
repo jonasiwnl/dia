@@ -4,13 +4,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
     error::DiaError,
     network::{DatagramReceiver, DatagramSender, UdpMulticastReceiver, UdpMulticastSender},
+    types::SequencerHeader,
 };
 
 pub struct Sequencer {
@@ -25,24 +25,7 @@ struct ReceivedPacket {
     src: SocketAddr,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct SequencerHeader {
-    pub msg_id: Uuid,
-    pub seq_num: u64,
-    pub timestamp_ns: u64,
-}
-
 const MESSAGE_ID_LEN: usize = 16;
-
-impl SequencerHeader {
-    pub fn encoded_len() -> Result<usize, DiaError> {
-        Ok(bincode::serialized_size(&Self {
-            msg_id: Uuid::nil(),
-            seq_num: 0,
-            timestamp_ns: 0,
-        })? as usize)
-    }
-}
 
 impl Sequencer {
     pub fn from_transport(

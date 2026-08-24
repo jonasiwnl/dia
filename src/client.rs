@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     error::DiaError,
     network::{DatagramReceiver, DatagramSender, UdpMulticastReceiver, UdpMulticastSender},
-    sequencer::SequencerHeader,
+    types::{SequencedMessage, SequencerHeader},
 };
 
 pub struct Client<Message> {
@@ -37,11 +37,6 @@ pub struct ClientReceiver<Message> {
 #[derive(serde::Serialize)]
 pub struct IdentifiedMessage<Message> {
     pub msg_id: uuid::Uuid,
-    pub payload: Message,
-}
-
-pub struct SequencedMessage<Message> {
-    pub header: SequencerHeader,
     pub payload: Message,
 }
 
