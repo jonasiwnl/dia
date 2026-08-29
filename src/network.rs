@@ -5,10 +5,14 @@ use std::{
     pin::Pin,
 };
 
+use serde::de::DeserializeOwned;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
-use crate::error::DiaError;
+use crate::{
+    error::DiaError,
+    types::{SequencedMessage, SequencerHeader},
+};
 
 pub const MAX_DATAGRAM_SIZE: usize = 65_535;
 
@@ -27,6 +31,33 @@ pub trait DatagramSender: Send + Sync {
 /// An inbound datagram endpoint. Implement this in tests to inject faults.
 pub trait DatagramReceiver: Send + Sync {
     fn recv(&self) -> NetworkFuture<'_, ReceivedDatagram>;
+}
+
+pub(crate) async fn recv_consensus_message<Message>(
+    network: &dyn DatagramReceiver,
+) -> Result<SequencedMessage<Message>, DiaError>
+where
+    Message: DeserializeOwned,
+{
+    let packet = network.recv().await.map_err(|error| {
+        eprintln!("[consensus] recv error: {error:?}");
+        DiaError::Network(error)
+    })?;
+    let amt = packet.bytes.len();
+    eprintln!("[consensus] received {amt} bytes from {}", packet.src);
+
+    let header_len = SequencerHeader::encoded_len()?;
+    if amt < header_len {
+        return Err(DiaError::MalformedPacket {
+            expected: header_len,
+            actual: amt,
+        });
+    }
+
+    let (header_bytes, payload_bytes) = packet.bytes.split_at(header_len);
+    let header = bincode::deserialize(header_bytes)?;
+    let payload = bincode::deserialize(payload_bytes)?;
+    Ok(SequencedMessage { header, payload })
 }
 
 pub struct UdpMulticastSender {

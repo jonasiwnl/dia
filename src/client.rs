@@ -6,8 +6,11 @@ use uuid::Uuid;
 
 use crate::{
     error::DiaError,
-    network::{DatagramReceiver, DatagramSender, UdpMulticastReceiver, UdpMulticastSender},
-    types::{SequencedMessage, SequencerHeader},
+    network::{
+        DatagramReceiver, DatagramSender, UdpMulticastReceiver, UdpMulticastSender,
+        recv_consensus_message,
+    },
+    types::SequencedMessage,
 };
 
 pub struct Client<Message> {
@@ -151,29 +154,7 @@ where
     Message: DeserializeOwned,
 {
     pub async fn recv(&self) -> Result<SequencedMessage<Message>, DiaError> {
-        match self.network.recv().await {
-            Ok(packet) => {
-                let amt = packet.bytes.len();
-                let src = packet.src;
-                eprintln!("[client] received {} bytes from {}", amt, src);
-                let header_len = SequencerHeader::encoded_len()?;
-                if amt < header_len {
-                    return Err(DiaError::MalformedPacket {
-                        expected: header_len,
-                        actual: amt,
-                    });
-                }
-
-                let (header_bytes, payload) = packet.bytes.split_at(header_len);
-                let header = bincode::deserialize(header_bytes)?;
-                let payload = bincode::deserialize(payload)?;
-                Ok(SequencedMessage { header, payload })
-            }
-            Err(e) => {
-                eprintln!("[client] recv error: {:?}", e);
-                Err(DiaError::Network(e))
-            }
-        }
+        recv_consensus_message(self.network.as_ref()).await
     }
 
     pub async fn listen<Handler>(&self, mut handler: Handler) -> Result<(), DiaError>
