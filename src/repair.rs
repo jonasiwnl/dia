@@ -4,10 +4,7 @@ use redb::Database;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    db::store_message,
-    error::DiaError,
-    network::{DatagramReceiver, UdpMulticastReceiver, recv_consensus_message},
-    types::SequencedMessage,
+    db::{retrieve_message, store_message}, error::DiaError, network::{DatagramReceiver, UdpMulticastReceiver, recv_consensus_message}, types::SequencedMessage,
 };
 
 pub struct RepairService<Message> {
@@ -52,6 +49,17 @@ where
         loop {
             let msg = self.recv().await?;
             store_message(&self.db_client, msg.header.seq_num, &[])?;
+        }
+    }
+
+    pub async fn help(&self) -> Result<(), DiaError> {
+        loop {
+            // Recv desired seq number
+            let seq_num = 0;
+            let _row = retrieve_message(&self.db_client, seq_num);
+            // If row is none, we have to communicate with other repair servers
+            // And maybe finally the sequencer?
+            // If row is some, send it back
         }
     }
 }
